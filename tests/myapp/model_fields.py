@@ -8,7 +8,6 @@ from django.utils.translation import ugettext_lazy as _
 
 try:
     from django.db.models import UUIDField
-    from django.forms import UUIDField as UUIDFormField
 except ImportError:
     class UUIDField(Field):
         """Emulate Django 1.8's django.db.models.fields.UUIDField."""
@@ -79,8 +78,8 @@ except ImportError:
                                 raise ValidationError(self.error_messages['invalid'], code='invalid')
                         return value
 
-                defaults = {
-                    'form_class': UUIDFormField,
-                }
+            defaults = {
+                'form_class': UUIDFormField,
+            }
             defaults.update(kwargs)
             return super(UUIDField, self).formfield(**defaults)
