@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover (Django 1.6 compatibility)
 from django.forms.models import modelform_factory
 from django.template import Template, TemplateSyntaxError, Context
 from django.test import TestCase
-from django.utils.six import string_types, PY3, b, assertRaisesRegex
+from django.utils.six import string_types, integer_types, PY3, b, assertRaisesRegex
 
 from mptt.exceptions import CantDisableUpdates, InvalidMove
 from mptt.forms import (
