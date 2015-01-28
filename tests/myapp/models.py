@@ -1,12 +1,16 @@
 from __future__ import unicode_literals
+import uuid
+
 from django.db import models
+from django.db.models.query import QuerySet
 from django.utils.encoding import python_2_unicode_compatible
 
 import mptt
 from mptt.fields import TreeForeignKey, TreeOneToOneField, TreeManyToManyField
 from mptt.models import MPTTModel
 from mptt.managers import TreeManager
-from django.db.models.query import QuerySet
+
+from .model_fields import UUIDField
 
 
 class CustomTreeQueryset(QuerySet):
@@ -21,6 +25,15 @@ class CustomTreeManager(TreeManager):
         # Django 1.8 removed the fallbacks here.
         return CustomTreeQueryset(model=self.model, using=self._db)
 
+@python_2_unicode_compatible
+class UUIDNode(MPTTModel):
+    """Tests a non-integer as a primary key (emulates Django 1.8's models.UUIDField)."""
+    id = UUIDField(default=uuid.uuid4, primary_key=True)
+    parent = models.ForeignKey('self', null=True, blank=True, related_name='children')
+    name = models.CharField(max_length=50)
+    
+    def __str__(self):
+        return self.name
 
 @python_2_unicode_compatible
 class Category(MPTTModel):
@@ -44,6 +57,7 @@ class Genre(MPTTModel):
         return self.name
 
 
+@python_2_unicode_compatible
 class Game(models.Model):
     genre = TreeForeignKey(Genre)
     genres_m2m = models.ManyToManyField(Genre, related_name='games_m2m')
