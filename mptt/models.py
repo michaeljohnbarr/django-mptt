@@ -13,6 +13,7 @@ from django.utils.translation import ugettext as _
 
 from mptt.fields import TreeForeignKey, TreeOneToOneField, TreeManyToManyField
 from mptt.managers import TreeManager
+from mptt.utils import _get_tree_model
 
 
 __all__ = (
@@ -307,11 +308,9 @@ class MPTTModelBase(ModelBase):
                 bases.insert(0, MPTTModel)
                 cls.__bases__ = tuple(bases)
 
-            for key in ('left_attr', 'right_attr', 'tree_id_attr', 'level_attr'):
-                field_name = getattr(cls._mptt_meta, key)
-                try:
-                    cls._meta.get_field(field_name)
-                except models.FieldDoesNotExist:
+            if _get_tree_model(cls) is cls:
+                for key in ('left_attr', 'right_attr', 'tree_id_attr', 'level_attr'):
+                    field_name = getattr(cls._mptt_meta, key)
                     field = models.PositiveIntegerField(db_index=True, editable=False)
                     field.contribute_to_class(cls, field_name)
 
@@ -325,8 +324,6 @@ class MPTTModelBase(ModelBase):
                     # manager was inherited
                     manager = manager._copy_to_model(cls)
                     manager.contribute_to_class(cls, 'objects')
-                if hasattr(manager, 'init_from_model'):
-                    manager.init_from_model(cls)
 
                 # make sure we have a tree manager somewhere
                 tree_manager = None
@@ -350,7 +347,6 @@ class MPTTModelBase(ModelBase):
                 elif tree_manager is None:
                     tree_manager = TreeManager()
                 tree_manager.contribute_to_class(cls, '_tree_manager')
-                tree_manager.init_from_model(cls)
 
                 # avoid using ManagerDescriptor, so instances can refer to self._tree_manager
                 setattr(cls, '_tree_manager', tree_manager)
@@ -465,28 +461,46 @@ class MPTTModel(six.with_metaclass(MPTTModelBase, models.Model)):
                 return self._tree_manager.none()
             else:
                 # Filter on pk for efficiency.
-                return self._tree_manager.filter(pk=self.pk)
+                qs = self._tree_manager.filter(pk=self.pk)
+        else:
+            opts = self._mptt_meta
 
-        opts = self._mptt_meta
+            order_by = opts.left_attr
+            if ascending:
+                order_by = '-' + order_by
 
-        order_by = opts.left_attr
-        if ascending:
-            order_by = '-' + order_by
+            left = getattr(self, opts.left_attr)
+            right = getattr(self, opts.right_attr)
 
-        left = getattr(self, opts.left_attr)
-        right = getattr(self, opts.right_attr)
+            if not include_self:
+                left -= 1
+                right += 1
 
-        if not include_self:
-            left -= 1
-            right += 1
+            qs = self._tree_manager._mptt_filter(
+                left__lte=left,
+                right__gte=right,
+                tree_id=self._mpttfield('tree_id'),
+            )
 
-        qs = self._tree_manager._mptt_filter(
-            left__lte=left,
-            right__gte=right,
-            tree_id=self._mpttfield('tree_id'),
-        )
+            qs = qs.order_by(order_by)
 
-        return qs.order_by(order_by)
+        if hasattr(self, '_mptt_use_cached_ancestors'):
+            # Called during or after a `recursetree` tag.
+            # There should be cached parents up to level 0.
+            # So we can use them to avoid doing a query at all.
+            ancestors = []
+            p = self
+            if not include_self:
+                p = getattr(p, opts.parent_attr)
+
+            while p is not None:
+                ancestors.append(p)
+                p = getattr(p, opts.parent_attr)
+
+            ancestors.reverse()
+            qs._result_cache = ancestors
+
+        return qs
 
     @raise_if_unsaved
     def get_family(self):
@@ -679,13 +693,13 @@ class MPTTModel(six.with_metaclass(MPTTModelBase, models.Model)):
         """
         return getattr(self, self._mptt_meta.level_attr)
 
-    def insert_at(self, target, position='first-child', save=False, allow_existing_pk=False):
+    def insert_at(self, target, position='first-child', save=False, allow_existing_pk=False, refresh_target=True):
         """
         Convenience method for calling ``TreeManager.insert_node`` with this
         model instance.
         """
         self._tree_manager.insert_node(
-            self, target, position, save, allow_existing_pk=allow_existing_pk)
+            self, target, position, save, allow_existing_pk=allow_existing_pk, refresh_target=refresh_target)
 
     def is_child_node(self):
         """
@@ -767,12 +781,12 @@ class MPTTModel(six.with_metaclass(MPTTModelBase, models.Model)):
     def _get_user_field_names(self):
         """ Returns the list of user defined (i.e. non-mptt internal) field names. """
         from django.db.models.fields import AutoField
-        
+
         field_names = []
         internal_fields = (self._mptt_meta.left_attr, self._mptt_meta.right_attr, self._mptt_meta.tree_id_attr,
                            self._mptt_meta.level_attr, self._mptt_meta.parent_attr)
         for field in self._meta.fields:
-            if (field.name not in internal_fields) and (not isinstance(field, AutoField)):
+            if (field.name not in internal_fields) and (not isinstance(field, AutoField)) and (not field.primary_key):
                 field_names.append(field.name)
         return field_names
 
@@ -872,7 +886,7 @@ class MPTTModel(six.with_metaclass(MPTTModelBase, models.Model)):
                             or getattr(self, opts.right_attr) > getattr(parent, opts.right_attr))
 
                     if right_sibling:
-                        self._tree_manager._move_node(self, right_sibling, 'left', save=False)
+                        self._tree_manager._move_node(self, right_sibling, 'left', save=False, refresh_target=False)
                     else:
                         # Default movement
                         if parent_id is None:
@@ -881,7 +895,7 @@ class MPTTModel(six.with_metaclass(MPTTModelBase, models.Model)):
                                 rightmost_sibling = root_nodes.exclude(
                                     pk=self.pk).order_by('-' + opts.tree_id_attr)[0]
                                 self._tree_manager._move_node(
-                                    self, rightmost_sibling, 'right', save=False)
+                                    self, rightmost_sibling, 'right', save=False, refresh_target=False)
                             except IndexError:
                                 pass
                         else:
@@ -929,7 +943,7 @@ class MPTTModel(six.with_metaclass(MPTTModelBase, models.Model)):
                         right_sibling = opts.get_ordered_insertion_target(self, parent)
 
                 if right_sibling:
-                    self.insert_at(right_sibling, 'left', allow_existing_pk=True)
+                    self.insert_at(right_sibling, 'left', allow_existing_pk=True, refresh_target=False)
 
                     if parent:
                         # since we didn't insert into parent, we have to update parent.rght
@@ -970,3 +984,17 @@ class MPTTModel(six.with_metaclass(MPTTModelBase, models.Model)):
 
         super(MPTTModel, self).delete(*args, **kwargs)
     delete.alters_data = True
+
+    def _mptt_refresh(self):
+        if not self.pk:
+            return
+        manager = type(self)._tree_manager
+        opts = self._mptt_meta
+        values = manager.filter(pk=self.pk).values(
+            opts.left_attr,
+            opts.right_attr,
+            opts.level_attr,
+            opts.tree_id_attr,
+        )[0]
+        for k, v in values.items():
+            setattr(self, k, v)

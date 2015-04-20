@@ -3,6 +3,8 @@ Template tags for working with lists of model instances which represent
 trees.
 """
 from __future__ import unicode_literals
+import warnings
+
 from django import template
 try:
     from django.apps import apps
@@ -245,7 +247,6 @@ def cache_tree_children(queryset):
 
     Returns a list of top-level nodes. If a single tree was provided in its
     entirety, the list will of course consist of just the tree's root node.
-
     """
 
     current_path = []
@@ -256,7 +257,15 @@ def cache_tree_children(queryset):
         mptt_opts = queryset.model._mptt_meta
         tree_id_attr = mptt_opts.tree_id_attr
         left_attr = mptt_opts.left_attr
-        queryset = queryset.order_by(tree_id_attr, left_attr)
+        if tuple(queryset.query.order_by) != (tree_id_attr, left_attr):
+            warnings.warn(
+                (
+                    "cache_tree_children() was passed a queryset with the wrong ordering: %r.\n"
+                    "This will cause an error in mptt 0.8."
+                ) % (queryset.query.order_by,),
+                UserWarning,
+            )
+            queryset = queryset.order_by(tree_id_attr, left_attr)
 
     if queryset:
         # Get the model's parent-attribute name
@@ -294,6 +303,10 @@ def cache_tree_children(queryset):
                 _parent = current_path[-1]
                 setattr(obj, parent_attr, _parent)
                 _parent._cached_children.append(obj)
+
+                if root_level == 0:
+                    # get_ancestors() can use .parent.parent.parent...
+                    setattr(obj, '_mptt_use_cached_ancestors', True)
 
             # Add the current node to end of the current path - the last node
             # in the current path is the parent for the next iteration, unless

@@ -10,6 +10,8 @@ from django.db.models import F, ManyToManyField, Max, Q
 from django.utils.translation import ugettext as _
 
 from mptt.exceptions import CantDisableUpdates, InvalidMove
+from mptt.querysets import TreeQuerySet
+from mptt.utils import _get_tree_model
 
 __all__ = ('TreeManager',)
 
@@ -17,7 +19,7 @@ __all__ = ('TreeManager',)
 COUNT_SUBQUERY = """(
     SELECT COUNT(*)
     FROM %(rel_table)s
-    WHERE %(mptt_fk)s = %(mptt_table)s.%(mptt_pk)s
+    WHERE %(mptt_fk)s = %(mptt_table)s.%(mptt_rel_to)s
 )"""
 
 CUMULATIVE_COUNT_SUBQUERY = """(
@@ -25,7 +27,7 @@ CUMULATIVE_COUNT_SUBQUERY = """(
     FROM %(rel_table)s
     WHERE %(mptt_fk)s IN
     (
-        SELECT m2.%(mptt_pk)s
+        SELECT m2.%(mptt_rel_to)s
         FROM %(mptt_table)s m2
         WHERE m2.%(tree_id)s = %(mptt_table)s.%(tree_id)s
           AND m2.%(left)s BETWEEN %(mptt_table)s.%(left)s
@@ -60,33 +62,16 @@ class TreeManager(models.Manager):
     A manager for working with trees of objects.
     """
 
-    def init_from_model(self, model):
-        """
-        Sets things up. This would normally be done in contribute_to_class(),
-        but Django calls that before we've created our extra tree fields on the
-        model (which we need). So it's done here instead, after field setup.
-        """
+    def contribute_to_class(self, model, name):
+        super(TreeManager, self).contribute_to_class(model, name)
 
-        # Avoid calling "get_field_by_name()", which populates the related
-        # models cache and can cause circular imports in complex projects.
-        # Instead, find the tree_id field using "get_fields_with_model()".
-        [tree_field] = [
-            fld
+        if not model._meta.abstract:
+            self.tree_model = _get_tree_model(model)
 
-            for fld in model._meta.get_fields_with_model()
-            if fld[0].name == self.tree_id_attr]
-        if tree_field[1]:
-            # tree_model is the model that contains the tree fields.
-            # This is usually just the same as model, but not for derived
-            # models.
-            self.tree_model = tree_field[1]
-        else:
-            self.tree_model = model
-
-        self._base_manager = None
-        if self.tree_model is not model:
-            # _base_manager is the treemanager on tree_model
-            self._base_manager = self.tree_model._tree_manager
+            self._base_manager = None
+            if self.tree_model is not model:
+                # _base_manager is the treemanager on tree_model
+                self._base_manager = self.tree_model._tree_manager
 
     def get_query_set(self, *args, **kwargs):
         """
@@ -94,15 +79,13 @@ class TreeManager(models.Manager):
 
         This method can be removed when support for Django < 1.6 is dropped.
         """
-        return super(TreeManager, self).get_query_set(*args, **kwargs).order_by(
-            self.tree_id_attr, self.left_attr)
+        return TreeQuerySet(self.model, using=self._db).order_by(self.tree_id_attr, self.left_attr)
 
     def get_queryset(self, *args, **kwargs):
         """
         Ensures that this manager always returns nodes in tree order.
         """
-        return super(TreeManager, self).get_queryset(*args, **kwargs).order_by(
-            self.tree_id_attr, self.left_attr)
+        return TreeQuerySet(self.model, using=self._db).order_by(self.tree_id_attr, self.left_attr)
 
     def _get_queryset_relatives(self, queryset, direction, include_self):
         """
@@ -445,7 +428,7 @@ class TreeManager(models.Manager):
                     'rel_table': qn(rel_model._meta.db_table),
                     'mptt_fk': qn(rel_model._meta.get_field(rel_field).column),
                     'mptt_table': qn(self.tree_model._meta.db_table),
-                    'mptt_pk': qn(meta.pk.column),
+                    'mptt_rel_to': qn(mptt_field.rel.field_name),
                     'tree_id': qn(meta.get_field(self.tree_id_attr).column),
                     'left': qn(meta.get_field(self.left_attr).column),
                     'right': qn(meta.get_field(self.right_attr).column),
@@ -455,12 +438,12 @@ class TreeManager(models.Manager):
                     'rel_table': qn(rel_model._meta.db_table),
                     'mptt_fk': qn(rel_model._meta.get_field(rel_field).column),
                     'mptt_table': qn(self.tree_model._meta.db_table),
-                    'mptt_pk': qn(meta.pk.column),
+                    'mptt_rel_to': qn(mptt_field.rel.field_name),
                 }
         return queryset.extra(select={count_attr: subquery})
 
     def insert_node(self, node, target, position='last-child', save=False,
-                    allow_existing_pk=False):
+                    allow_existing_pk=False, refresh_target=True):
         """
         Sets up the tree state for ``node`` (which has not yet been
         inserted into in the database) so it will be positioned relative
@@ -481,7 +464,7 @@ class TreeManager(models.Manager):
 
         if self._base_manager:
             return self._base_manager.insert_node(
-                node, target, position=position, save=save)
+                node, target, position=position, save=save, allow_existing_pk=allow_existing_pk)
 
         if node.pk and not allow_existing_pk and self.filter(pk=node.pk).exists():
             raise ValueError(_('Cannot insert a node which has already been saved.'))
@@ -494,6 +477,10 @@ class TreeManager(models.Manager):
             setattr(node, self.tree_id_attr, tree_id)
             setattr(node, self.parent_attr, None)
         elif target.is_root_node() and position in ['left', 'right']:
+            if refresh_target:
+                # Ensure mptt values on target are not stale.
+                target._mptt_refresh()
+
             target_tree_id = getattr(target, self.tree_id_attr)
             if position == 'left':
                 tree_id = target_tree_id
@@ -512,10 +499,14 @@ class TreeManager(models.Manager):
             setattr(node, self.left_attr, 0)
             setattr(node, self.level_attr, 0)
 
+            if refresh_target:
+                # Ensure mptt values on target are not stale.
+                target._mptt_refresh()
+
             space_target, level, left, parent, right_shift = \
                 self._calculate_inter_tree_move_values(node, target, position)
-            tree_id = getattr(parent, self.tree_id_attr)
 
+            tree_id = getattr(target, self.tree_id_attr)
             self._create_space(2, space_target, tree_id)
 
             setattr(node, self.left_attr, -left)
@@ -531,14 +522,14 @@ class TreeManager(models.Manager):
             node.save()
         return node
 
-    def _move_node(self, node, target, position='last-child', save=True):
+    def _move_node(self, node, target, position='last-child', save=True, refresh_target=True):
         if self._base_manager:
             return self._base_manager.move_node(node, target, position=position)
 
         if self.tree_model._mptt_is_tracking:
             # delegate to insert_node and clean up the gaps later.
             return self.insert_node(node, target, position=position, save=save,
-                                    allow_existing_pk=True)
+                                    allow_existing_pk=True, refresh_target=refresh_target)
         else:
             if target is None:
                 if node.is_child_node():

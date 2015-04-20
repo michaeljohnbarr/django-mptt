@@ -32,13 +32,14 @@ from mptt.forms import (
     MPTTAdminForm, TreeNodeChoiceField, TreeNodeMultipleChoiceField,
     MoveNodeForm)
 from mptt.models import MPTTModel
+from mptt.managers import TreeManager
 from mptt.templatetags.mptt_tags import cache_tree_children
 from mptt.utils import print_debug_info
 
 from myapp.models import (
-    Category, Genre, CustomPKName, SingleProxyModel, DoubleProxyModel,
+    Category, Item, Genre, CustomPKName, SingleProxyModel, DoubleProxyModel,
     ConcreteModel, OrderedInsertion, AutoNowDateFieldModel, Person,
-    CustomTreeQueryset, Node, ReferencingModel, UUIDNode)
+    CustomTreeQueryset, Node, ReferencingModel, CustomTreeManager, UUIDNode)
 
 
 extra_queries_per_update = 0
@@ -337,7 +338,7 @@ class ConcurrencyTestCase(TreeTestCase):
         ConcreteModel.objects.create(name="Pear", parent=fruit)
         ConcreteModel.objects.create(name="Tomato", parent=vegie)
         ConcreteModel.objects.create(name="Carrot", parent=vegie)
-        
+
         # sanity check
         self.assertTreeEqual(ConcreteModel.objects.all(), """
             1 - 1 0 1 6
@@ -347,12 +348,12 @@ class ConcurrencyTestCase(TreeTestCase):
             5 2 2 1 2 3
             6 2 2 1 4 5
         """)
-    
+
     def _modify_tree(self):
         fruit = ConcreteModel.objects.get(name="Fruit")
         vegie = ConcreteModel.objects.get(name="Vegie")
         vegie.move_to(fruit)
-    
+
     def _assert_modified_tree_state(self):
         carrot = ConcreteModel.objects.get(id=6)
         self.assertTreeEqual([carrot], '6 2 1 2 5 6')
@@ -364,48 +365,48 @@ class ConcurrencyTestCase(TreeTestCase):
             3 1 1 1 8 9
             4 1 1 1 10 11
         """)
-        
-        
+
+
     def test_node_save_after_tree_restructuring(self):
         carrot = ConcreteModel.objects.get(id=6)
-        
+
         self._modify_tree()
-        
+
         carrot.name = "Purple carrot"
         carrot.save()
-        
+
         self._assert_modified_tree_state()
-    
+
     def test_node_save_after_tree_restructuring_with_update_fields(self):
         """
         Test that model is saved properly when passing update_fields as keyword or positional argument.
         """
         carrot = ConcreteModel.objects.get(id=6)
-        
+
         self._modify_tree()
-        
+
         # update with kwargs
         carrot.name = "Won't change"
         carrot.ghosts = "Will get updated"
         carrot.save(update_fields=["ghosts"])
-        
+
         self._assert_modified_tree_state()
-        
+
         updated_carrot = ConcreteModel.objects.get(id=6)
-        
+
         self.assertEqual(updated_carrot.ghosts, carrot.ghosts)
         self.assertNotEqual(updated_carrot.name, carrot.name)
-        
+
         # update with positional arguments
         carrot.name = "Will change"
         carrot.ghosts = "Will not be updated"
         carrot.save(False, False, None, ["name"])
-        
+
         updated_carrot = ConcreteModel.objects.get(id=6)
         self.assertNotEqual(updated_carrot.ghosts, carrot.ghosts)
         self.assertEqual(updated_carrot.name, carrot.name)
 
-    
+
 # categories.json defines the following tree structure:
 #
 # 1 - 1 0 1 20    games
@@ -784,12 +785,13 @@ class DelayedUpdatesTestCase(TreeTestCase):
         self.assertFalse(ConcreteModel._mptt_is_tracking)
 
     def test_insert_child(self):
-        with self.assertNumQueries(7):
+        with self.assertNumQueries(8):
             with ConcreteModel.objects.delay_mptt_updates():
-                with self.assertNumQueries(1):
-                    # 1 query here:
+                with self.assertNumQueries(2):
+                    # 1 query for target stale check,
+                    # 1 query to save node.
                     ConcreteModel.objects.create(name="e", parent=self.d)
-                # 2nd query here:
+                # 3rd query here:
                 self.assertTreeEqual(ConcreteModel.objects.all(), """
                     1 - 1 0 1 6
                     2 1 1 1 2 3
@@ -798,7 +800,7 @@ class DelayedUpdatesTestCase(TreeTestCase):
                     6 4 2 1 2 3
                     5 - 3 0 1 2
                 """)
-                # remaining queries (3 through 7) are the partial rebuild process.
+                # remaining queries (4 through 8) are the partial rebuild process.
 
         self.assertTreeEqual(ConcreteModel.objects.all(), """
             1 - 1 0 1 6
@@ -837,13 +839,14 @@ class DelayedUpdatesTestCase(TreeTestCase):
         """)
 
     def test_move_node_same_tree(self):
-        with self.assertNumQueries(9 + extra_queries_per_update):
+        with self.assertNumQueries(10 + extra_queries_per_update):
             with ConcreteModel.objects.delay_mptt_updates():
-                with self.assertNumQueries(1 + extra_queries_per_update):
+                with self.assertNumQueries(2 + extra_queries_per_update):
+                    # 1 query to ensure target fields aren't stale
                     # 1 update query
                     self.c.parent = self.b
                     self.c.save()
-                # query 2 here:
+                # query 3 here:
                 self.assertTreeEqual(ConcreteModel.objects.all(), """
                     1 - 1 0 1 6
                     2 1 1 1 2 3
@@ -960,9 +963,9 @@ class OrderedInsertionDelayedUpdatesTestCase(TreeTestCase):
         """)
 
     def test_insert_child(self):
-        with self.assertNumQueries(11):
+        with self.assertNumQueries(12):
             with OrderedInsertion.objects.delay_mptt_updates():
-                with self.assertNumQueries(1):
+                with self.assertNumQueries(2):
                     # 1 query here:
                     OrderedInsertion.objects.create(name="dd", parent=self.c)
                 # 2nd query here:
@@ -1133,11 +1136,11 @@ class ManagerTests(TreeTestCase):
             if not issubclass(model, MPTTModel):
                 continue
             tm = model._tree_manager
-            if tm in seen:
+            if id(tm) in seen:
                 self.fail(
                     "Tree managers for %s and %s are the same manager"
-                    % (model.__name__, seen[tm].__name__))
-            seen[tm] = model
+                    % (model.__name__, seen[id(tm)].__name__))
+            seen[id(tm)] = model
 
     def test_all_managers_have_correct_model(self):
         # all tree managers should have the correct model.
@@ -1159,6 +1162,12 @@ class ManagerTests(TreeTestCase):
             else:
                 self.fail("Detected infinite recursion in %s._tree_manager._base_manager" % model)
 
+    def test_proxy_custom_manager(self):
+        self.assertIsInstance(SingleProxyModel._tree_manager, CustomTreeManager)
+        self.assertIsInstance(SingleProxyModel._tree_manager._base_manager, TreeManager)
+
+        self.assertIsInstance(SingleProxyModel.objects, CustomTreeManager)
+        self.assertIsInstance(SingleProxyModel.objects._base_manager, TreeManager)
 
     def test_get_queryset_descendants(self):
         def get_desc_names(qs, include_self=False):
@@ -1314,6 +1323,20 @@ class RecurseTreeTestCase(TreeTestCase):
             TemplateSyntaxError,
             Template,
             '{% load mptt_tags %}{% recursetree %}{% endrecursetree %}')
+
+    def test_cached_ancestors(self):
+        template = Template('''
+            {% load mptt_tags %}
+            {% recursetree nodes %}
+                {{ node.get_ancestors|join:" > " }} {{ node.name }}
+                {% if not node.is_leaf_node %}
+                    {{ children }}
+                {% endif %}
+            {% endrecursetree %}
+        ''')
+        with self.assertNumQueries(1):
+            qs = Category.objects.all()
+            template.render(Context({'nodes': qs}))
 
 
 class TreeInfoTestCase(TreeTestCase):
@@ -1642,3 +1665,121 @@ class TestUnsaved(TreeTestCase):
                 ValueError,
                 'Cannot call %s on unsaved Genre instances' % method,
                 getattr(Genre(), method))
+
+
+class QuerySetTests(TreeTestCase):
+    fixtures = ['categories.json']
+
+    def test_get_ancestors(self):
+        self.assertEqual(
+            [c.pk for c in Category.objects.get(name="Nintendo Wii").get_ancestors(include_self=False)],
+            [c.pk for c in Category.objects.filter(name="Nintendo Wii").get_ancestors(include_self=False)],
+        )
+        self.assertEqual(
+            [c.pk for c in Category.objects.get(name="Nintendo Wii").get_ancestors(include_self=True)],
+            [c.pk for c in Category.objects.filter(name="Nintendo Wii").get_ancestors(include_self=True)],
+        )
+
+    def test_get_descendants(self):
+        self.assertEqual(
+            [c.pk for c in Category.objects.get(name="Nintendo Wii").get_descendants(include_self=False)],
+            [c.pk for c in Category.objects.filter(name="Nintendo Wii").get_descendants(include_self=False)],
+        )
+        self.assertEqual(
+            [c.pk for c in Category.objects.get(name="Nintendo Wii").get_descendants(include_self=True)],
+            [c.pk for c in Category.objects.filter(name="Nintendo Wii").get_descendants(include_self=True)],
+        )
+
+
+class TreeManagerTestCase(TreeTestCase):
+
+    fixtures = ['categories.json', 'items.json']
+
+    def test_add_related_count_with_fk_to_natural_key(self):
+        # Regression test for #284
+        queryset = Category.objects.filter(name='Xbox 360').order_by('id')
+
+        # Test using FK that doesn't point to a primary key
+        for c in Category.objects.add_related_count(
+                queryset, Item, 'category_fk', 'item_count', cumulative=False):
+            self.assertEqual(c.item_count, c.items_by_pk.count())
+
+        # Also works when using the FK that *does* point to a primary key
+        for c in Category.objects.add_related_count(
+                queryset, Item, 'category_pk', 'item_count', cumulative=False):
+            self.assertEqual(c.item_count, c.items_by_pk.count())
+
+
+class TestOrderedInsertionBFS(TreeTestCase):
+    def test_insert_ordered_DFS_backwards_root_nodes(self):
+        rock = OrderedInsertion.objects.create(name="Rock")
+
+        OrderedInsertion.objects.create(name="Led Zeppelin", parent=rock)
+
+        OrderedInsertion.objects.create(name="Classical")
+
+        self.assertTreeEqual(OrderedInsertion.objects.all(), """
+            3 - 1 0 1 2
+            1 - 2 0 1 4
+            2 1 2 1 2 3
+        """)
+
+    def test_insert_ordered_BFS_backwards_root_nodes(self):
+        rock = OrderedInsertion.objects.create(name="Rock")
+
+        self.assertTreeEqual(OrderedInsertion.objects.all(), """
+            1 - 1 0 1 2
+        """)
+
+        OrderedInsertion.objects.create(name="Classical")
+
+        self.assertTreeEqual(OrderedInsertion.objects.all(), """
+            2 - 1 0 1 2
+            1 - 2 0 1 2
+        """)
+
+        # This tends to fail if it uses `rock.tree_id`, which is 1, although
+        # in the database Rock's tree_id has been updated to 2.
+
+        OrderedInsertion.objects.create(name="Led Zeppelin", parent=rock)
+        self.assertTreeEqual(OrderedInsertion.objects.all(), """
+            2 - 1 0 1 2
+            1 - 2 0 1 4
+            3 1 2 1 2 3
+        """)
+
+    def test_insert_ordered_DFS_backwards_nonroot_nodes(self):
+        music = OrderedInsertion.objects.create(name='music')
+        rock = OrderedInsertion.objects.create(name="Rock", parent=music)
+
+        OrderedInsertion.objects.create(name="Led Zeppelin", parent=rock)
+
+        OrderedInsertion.objects.create(name="Classical", parent=music)
+
+        self.assertTreeEqual(OrderedInsertion.objects.all(), """
+            1 - 1 0 1 8
+            4 1 1 1 2 3
+            2 1 1 1 4 7
+            3 2 1 2 5 6
+        """)
+
+
+    def test_insert_ordered_BFS_backwards_nonroot_nodes(self):
+        music = OrderedInsertion.objects.create(name='music')
+        rock = OrderedInsertion.objects.create(name="Rock", parent=music)
+        OrderedInsertion.objects.create(name="Classical", parent=music)
+
+        self.assertTreeEqual(OrderedInsertion.objects.all(), """
+            1 - 1 0 1 6
+            3 1 1 1 2 3
+            2 1 1 1 4 5
+        """)
+
+        OrderedInsertion.objects.create(name="Led Zeppelin", parent=rock)
+
+        self.assertTreeEqual(OrderedInsertion.objects.all(), """
+            1 - 1 0 1 8
+            3 1 1 1 2 3
+            2 1 1 1 4 7
+            4 2 1 2 5 6
+        """)
