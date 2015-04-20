@@ -993,6 +993,7 @@ class TreeManager(models.Manager):
         # Make space for the subtree which will be moved
         self._create_space(tree_width, space_target, new_tree_id)
         # Move the subtree
+        connection = self._get_connection(instance=node)
         self._inter_tree_move_and_close_gap(
             node, level_change, left_right_change, new_tree_id,
             parent._meta.pk.get_db_prep_value(parent.pk, connection))
